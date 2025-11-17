@@ -6,6 +6,7 @@
 //!
 //! API Reference: https://ai.google.dev/api/rest/v1beta/models/generateContent
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::ModelProviderInfo;
@@ -255,6 +256,7 @@ pub(crate) fn build_google_genai_request(
 
     // Convert conversation history to Google contents format
     let mut contents: Vec<GoogleGenAiContent> = Vec::new();
+    let mut function_call_names: HashMap<String, String> = HashMap::new();
     let input = prompt.get_formatted_input();
 
     for item in &input {
@@ -297,11 +299,12 @@ pub(crate) fn build_google_genai_request(
             ResponseItem::FunctionCall {
                 name,
                 arguments,
-                call_id: _,
+                call_id,
                 ..
             } => {
                 // Parse arguments string to JSON
                 let args: JsonValue = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+                function_call_names.insert(call_id.clone(), name.clone());
 
                 contents.push(GoogleGenAiContent {
                     role: "model".to_string(),
@@ -315,7 +318,7 @@ pub(crate) fn build_google_genai_request(
                     }],
                 });
             }
-            ResponseItem::FunctionCallOutput { call_id: _, output } => {
+            ResponseItem::FunctionCallOutput { call_id, output } => {
                 // For Google, we need to use the function name from the call
                 // We'll use "function_response" as a generic name if not available
                 // The content is the output
@@ -333,13 +336,18 @@ pub(crate) fn build_google_genai_request(
                     json!({ "output": output.content })
                 };
 
+                let function_name = function_call_names
+                    .get(call_id)
+                    .cloned()
+                    .unwrap_or_else(|| "function".to_string());
+
                 contents.push(GoogleGenAiContent {
                     role: "user".to_string(), // Function responses come from user
                     parts: vec![GoogleGenAiPart {
                         text: None,
                         function_call: None,
                         function_response: Some(GoogleGenAiFunctionResponse {
-                            name: "function".to_string(), // Generic name
+                            name: function_name,
                             response: response_json,
                         }),
                     }],
@@ -351,7 +359,13 @@ pub(crate) fn build_google_genai_request(
                 action,
                 status: _,
             } => {
-                let args = local_shell_call_arguments(action, call_id.as_ref().or(id.as_ref()));
+                let call_identifier = call_id.as_ref().or(id.as_ref());
+                if let Some(identifier) = call_identifier {
+                    function_call_names
+                        .entry(identifier.clone())
+                        .or_insert_with(|| "local_shell".to_string());
+                }
+                let args = local_shell_call_arguments(action, call_identifier);
                 contents.push(GoogleGenAiContent {
                     role: "model".to_string(),
                     parts: vec![GoogleGenAiPart {
@@ -926,24 +940,32 @@ mod tests {
     fn test_function_response_mapping() {
         let model_family = create_test_model_family();
         let mut prompt = create_test_prompt();
-        prompt.input = vec![ResponseItem::FunctionCallOutput {
-            call_id: "call_123".to_string(),
-            output: FunctionCallOutputPayload {
-                success: Some(true),
-                content: "The weather is sunny".to_string(),
-                content_items: None,
+        prompt.input = vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+                call_id: "call_123".to_string(),
             },
-        }];
+            ResponseItem::FunctionCallOutput {
+                call_id: "call_123".to_string(),
+                output: FunctionCallOutputPayload {
+                    success: Some(true),
+                    content: "The weather is sunny".to_string(),
+                    content_items: None,
+                },
+            },
+        ];
 
         let request = build_google_genai_request(&prompt, &model_family).unwrap();
 
-        assert_eq!(request.contents.len(), 1);
-        let content = &request.contents[0];
+        assert_eq!(request.contents.len(), 2);
+        let content = &request.contents[1];
         assert_eq!(content.role, "user"); // Function responses come from user
         assert!(content.parts[0].function_response.is_some());
 
         let func_resp = content.parts[0].function_response.as_ref().unwrap();
-        assert_eq!(func_resp.name, "function");
+        assert_eq!(func_resp.name, "get_weather");
     }
 
     #[test]
