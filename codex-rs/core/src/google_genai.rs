@@ -60,31 +60,8 @@ fn process_json_schema_for_google_genai(schema: &JsonValue) -> JsonValue {
                     continue;
                 }
 
-                // Recursively process nested schemas
-                if key == "properties" {
-                    if let JsonValue::Object(props) = value {
-                        let mut processed_props = serde_json::Map::new();
-                        for (prop_key, prop_value) in props {
-                            processed_props.insert(prop_key.clone(), process_json_schema_for_google_genai(prop_value));
-                        }
-                        processed.insert(key.clone(), JsonValue::Object(processed_props));
-                    } else {
-                        processed.insert(key.clone(), process_json_schema_for_google_genai(value));
-                    }
-                } else if key == "items" {
-                    processed.insert(key.clone(), process_json_schema_for_google_genai(value));
-                } else if key == "anyOf" {
-                    if let JsonValue::Array(arr) = value {
-                        let processed_arr: Vec<JsonValue> = arr.iter()
-                            .map(|item| process_json_schema_for_google_genai(item))
-                            .collect();
-                        processed.insert(key.clone(), JsonValue::Array(processed_arr));
-                    } else {
-                        processed.insert(key.clone(), value.clone());
-                    }
-                } else {
-                    processed.insert(key.clone(), value.clone());
-                }
+                // Recursively process all object values to catch nested additionalProperties
+                processed.insert(key.clone(), process_json_schema_for_google_genai(value));
             }
 
             JsonValue::Object(processed)
@@ -681,6 +658,7 @@ pub(crate) async fn stream_google_genai(
 
         match res {
             Ok(resp) if resp.status().is_success() => {
+                debug!("Google GenAI HTTP response successful: status={}", resp.status());
                 let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
                 let stream = resp.bytes_stream().map_err(|e| {
                     CodexErr::ResponseStreamFailed(ResponseStreamFailed {
@@ -700,8 +678,10 @@ pub(crate) async fn stream_google_genai(
             }
             Ok(res) => {
                 let status = res.status();
+                let body = res.text().await.unwrap_or_default();
+                debug!("Google GenAI HTTP response: status={}, body={}", status, body);
+
                 if !(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
-                    let body = res.text().await.unwrap_or_default();
                     return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
                         status,
                         body,
@@ -714,7 +694,6 @@ pub(crate) async fn stream_google_genai(
                     tokio::time::sleep(backoff(attempt)).await;
                     continue;
                 } else {
-                    let body = res.text().await.unwrap_or_default();
                     return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
                         status,
                         body,
@@ -766,7 +745,10 @@ async fn process_google_genai_sse<S>(
         otel_event_manager.log_sse_event(&response, duration);
 
         let sse = match response {
-            Ok(Some(Ok(ev))) => ev,
+            Ok(Some(Ok(ev))) => {
+                debug!("Google GenAI SSE event: event='{}', data='{}'", ev.event, ev.data);
+                ev
+            }
             Ok(Some(Err(e))) => {
                 let _ = tx_event
                     .send(Err(CodexErr::Stream(e.to_string(), None)))
@@ -775,6 +757,7 @@ async fn process_google_genai_sse<S>(
             }
             Ok(None) => {
                 // Stream closed gracefully
+                debug!("Google GenAI SSE stream closed gracefully");
                 finalize_google_response(&tx_event, &mut assistant_item).await;
 
                 let _ = tx_event
@@ -786,6 +769,7 @@ async fn process_google_genai_sse<S>(
                 return;
             }
             Err(_) => {
+                debug!("Google GenAI SSE stream timed out");
                 let _ = tx_event
                     .send(Err(CodexErr::Stream(
                         "idle timeout waiting for SSE from Google GenAI".into(),
