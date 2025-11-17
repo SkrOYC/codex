@@ -25,6 +25,7 @@ use bytes::Bytes;
 use codex_otel::otel_event_manager::OtelEventManager;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use eventsource_stream::Eventsource;
@@ -344,9 +345,27 @@ pub(crate) fn build_google_genai_request(
                     }],
                 });
             }
+            ResponseItem::LocalShellCall {
+                id,
+                call_id,
+                action,
+                status: _,
+            } => {
+                let args = local_shell_call_arguments(action, call_id.as_ref().or(id.as_ref()));
+                contents.push(GoogleGenAiContent {
+                    role: "model".to_string(),
+                    parts: vec![GoogleGenAiPart {
+                        text: None,
+                        function_call: Some(GoogleGenAiFunctionCall {
+                            name: "local_shell".to_string(),
+                            args: Some(args),
+                        }),
+                        function_response: None,
+                    }],
+                });
+            }
             // Skip other item types that don't map to Google's format
             ResponseItem::Reasoning { .. }
-            | ResponseItem::LocalShellCall { .. }
             | ResponseItem::CustomToolCall { .. }
             | ResponseItem::CustomToolCallOutput { .. }
             | ResponseItem::WebSearchCall { .. }
@@ -385,8 +404,12 @@ pub(crate) fn build_google_genai_request(
                         parameters: Some(parameters_json),
                     })
                 }
-                // Skip other tool types for now
-                _ => None,
+                ToolSpec::LocalShell {} => Some(GoogleGenAiFunctionDeclaration {
+                    name: "local_shell".to_string(),
+                    description: "Execute a shell command on the local machine.".to_string(),
+                    parameters: Some(local_shell_parameters_schema()),
+                }),
+                ToolSpec::WebSearch {} => None, // Google GenAI doesn't support our OpenAI-specific web search helper.
             })
             .collect();
 
@@ -695,6 +718,74 @@ async fn finalize_google_response(
     }
 }
 
+fn local_shell_call_arguments(action: &LocalShellAction, call_id: Option<&String>) -> JsonValue {
+    match action {
+        LocalShellAction::Exec(exec) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("command".to_string(), json!(&exec.command));
+            if let Some(dir) = &exec.working_directory {
+                obj.insert("workdir".to_string(), json!(dir));
+            }
+            if let Some(timeout) = exec.timeout_ms {
+                obj.insert("timeout_ms".to_string(), json!(timeout));
+            }
+            if let Some(env) = &exec.env {
+                obj.insert("env".to_string(), json!(env));
+            }
+            if let Some(user) = &exec.user {
+                obj.insert("user".to_string(), json!(user));
+            }
+            if let Some(id) = call_id {
+                obj.insert("call_id".to_string(), json!(id));
+            }
+            JsonValue::Object(obj)
+        }
+    }
+}
+
+fn local_shell_parameters_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "array",
+                "description": "The command to execute",
+                "items": { "type": "string" }
+            },
+            "workdir": {
+                "type": "string",
+                "description": "The working directory to execute the command in"
+            },
+            "timeout_ms": {
+                "type": "number",
+                "description": "The timeout for the command in milliseconds"
+            },
+            "env": {
+                "type": "object",
+                "description": "Optional environment variables"
+            },
+            "user": {
+                "type": "string",
+                "description": "Optional user to run the command as"
+            },
+            "with_escalated_permissions": {
+                "type": ["boolean", "null"],
+                "description": "Whether to request escalated permissions"
+            },
+            "justification": {
+                "type": ["string", "null"],
+                "description": "Short justification when escalated permissions are required"
+            },
+            "call_id": {
+                "type": "string",
+                "description": "Call identifier for correlating tool outputs"
+            }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+    })
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -712,6 +803,9 @@ mod tests {
     use codex_protocol::ConversationId;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::LocalShellAction;
+    use codex_protocol::models::LocalShellExecAction;
+    use codex_protocol::models::LocalShellStatus;
     use futures::stream;
     use std::collections::BTreeMap;
     use tokio::time::Duration;
@@ -951,6 +1045,24 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_spec_conversion_local_shell() {
+        let model_family = create_test_model_family();
+        let mut prompt = create_test_prompt();
+        prompt.tools = vec![ToolSpec::LocalShell {}];
+
+        let request = build_google_genai_request(&prompt, &model_family).unwrap();
+
+        assert!(request.tools.is_some());
+        let tools = request.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function_declarations.len(), 1);
+
+        let func_decl = &tools[0].function_declarations[0];
+        assert_eq!(func_decl.name, "local_shell");
+        assert!(func_decl.parameters.is_some());
+    }
+
+    #[test]
     fn test_empty_message_skipped() {
         let model_family = create_test_model_family();
         let mut prompt = create_test_prompt();
@@ -1084,6 +1196,38 @@ mod tests {
         assert!(result.is_ok());
         let chunk = result.unwrap();
         assert_eq!(chunk.candidates.len(), 0);
+    }
+
+    #[test]
+    fn test_local_shell_call_mapping() {
+        let model_family = create_test_model_family();
+        let mut prompt = create_test_prompt();
+        prompt.input = vec![ResponseItem::LocalShellCall {
+            id: Some("shell_call".to_string()),
+            call_id: Some("call_123".to_string()),
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["ls".to_string(), "-a".to_string()],
+                timeout_ms: Some(5000),
+                working_directory: Some("/tmp".to_string()),
+                env: None,
+                user: None,
+            }),
+        }];
+
+        let request = build_google_genai_request(&prompt, &model_family).unwrap();
+
+        assert_eq!(request.contents.len(), 1);
+        let content = &request.contents[0];
+        assert_eq!(content.role, "model");
+        let part = &content.parts[0];
+        let function_call = part.function_call.as_ref().unwrap();
+        assert_eq!(function_call.name, "local_shell");
+        let args = function_call.args.as_ref().unwrap();
+        assert_eq!(args["command"], json!(["ls", "-a"]));
+        assert_eq!(args["workdir"], json!("/tmp"));
+        assert_eq!(args["timeout_ms"], json!(5000));
+        assert_eq!(args["call_id"], json!("call_123"));
     }
 
     #[tokio::test]
