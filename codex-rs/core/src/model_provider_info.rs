@@ -145,16 +145,17 @@ impl ModelProviderInfo {
             return Ok(Some(CodexAuth::from_api_key(secret_key)));
         }
 
-        match self.api_key() {
-            Ok(Some(key)) => Ok(Some(CodexAuth::from_api_key(&key))),
-            Ok(None) => Ok(auth.clone()),
-            Err(err) => {
-                if auth.is_some() {
-                    Ok(auth.clone())
-                } else {
-                    Err(err)
-                }
-            }
+        let api_key = self.api_key()?;
+        if self.wire_api == WireApi::GoogleGenAI {
+            // Google GenAI requires API keys via `x-goog-api-key` (or `?key=`) instead of bearer auth.
+            // Ensure the env var is present (api_key()? above) but do not attach it as Authorization header.
+            return Ok(auth.clone());
+        }
+
+        if let Some(key) = api_key {
+            Ok(Some(CodexAuth::from_api_key(&key)))
+        } else {
+            Ok(auth.clone())
         }
     }
 
@@ -504,6 +505,30 @@ fn matches_azure_responses_base_url(base_url: &str) -> bool {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::ffi::OsString;
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn test_deserialize_ollama_model_provider_toml() {
@@ -686,6 +711,15 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             env_headers.get("x-goog-api-key"),
             Some(&"GOOGLE_GENAI_API_KEY".to_string())
         );
+    }
+
+    #[test]
+    fn test_google_genai_api_key_not_used_as_bearer() {
+        let _guard = EnvGuard::set("GOOGLE_GENAI_API_KEY", "dummy-key");
+        let provider = create_google_genai_provider();
+
+        let auth = provider.resolve_effective_auth(&None).unwrap();
+        assert!(auth.is_none());
     }
 
     #[test]
