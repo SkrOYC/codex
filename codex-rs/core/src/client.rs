@@ -141,6 +141,7 @@ impl ModelClient {
     }
 
     pub async fn stream(&self, prompt: &Prompt) -> Result<ResponseStream> {
+        debug!("Client.stream() called with wire_api: {:?}", self.provider.wire_api);
         match self.provider.wire_api {
             WireApi::Responses => self.stream_responses(prompt).await,
             WireApi::Chat => {
@@ -181,6 +182,7 @@ impl ModelClient {
                 Ok(ResponseStream { rx_event: rx })
             }
             WireApi::GoogleGenAI => {
+                debug!("Routing to Google GenAI streaming");
                 crate::google_genai::stream_google_genai(
                     prompt,
                     &self.config.model_family,

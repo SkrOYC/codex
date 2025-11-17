@@ -615,6 +615,8 @@ pub(crate) async fn stream_google_genai(
     otel_event_manager: &OtelEventManager,
     _session_source: &SessionSource,
 ) -> Result<ResponseStream> {
+    debug!("Starting Google GenAI streaming request for model: {}", model_family.slug);
+
     // Build the request payload
     let request = build_google_genai_request(prompt, model_family)?;
     let payload = serde_json::to_value(&request)?;
