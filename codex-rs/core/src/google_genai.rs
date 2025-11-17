@@ -444,7 +444,10 @@ pub(crate) async fn stream_google_genai(
         let url = get_google_genai_streaming_url(provider, model);
 
         // Create request builder with auth and headers
-        let req_builder = match provider.create_request_builder(client, &None).await {
+        let req_builder = match provider
+            .create_request_builder_with_url(client, &None, url.clone())
+            .await
+        {
             Ok(builder) => builder,
             Err(e) => {
                 if attempt == max_retries {

@@ -117,24 +117,53 @@ impl ModelProviderInfo {
         client: &'a CodexHttpClient,
         auth: &Option<CodexAuth>,
     ) -> crate::error::Result<CodexRequestBuilder> {
-        let effective_auth = if let Some(secret_key) = &self.experimental_bearer_token {
-            Some(CodexAuth::from_api_key(secret_key))
-        } else {
-            match self.api_key() {
-                Ok(Some(key)) => Some(CodexAuth::from_api_key(&key)),
-                Ok(None) => auth.clone(),
-                Err(err) => {
-                    if auth.is_some() {
-                        auth.clone()
-                    } else {
-                        return Err(err);
-                    }
+        let effective_auth = self.resolve_effective_auth(auth)?;
+        let url = self.get_full_url(&effective_auth);
+        self.create_request_builder_with_resolved_url(client, effective_auth, url)
+            .await
+    }
+
+    /// Same as [`create_request_builder`] but allows the caller to specify the exact URL.
+    ///
+    /// Useful for providers like Google GenAI where the model slug must appear inside the path.
+    pub async fn create_request_builder_with_url<'a>(
+        &'a self,
+        client: &'a CodexHttpClient,
+        auth: &Option<CodexAuth>,
+        url: String,
+    ) -> crate::error::Result<CodexRequestBuilder> {
+        let effective_auth = self.resolve_effective_auth(auth)?;
+        self.create_request_builder_with_resolved_url(client, effective_auth, url)
+            .await
+    }
+
+    fn resolve_effective_auth(
+        &self,
+        auth: &Option<CodexAuth>,
+    ) -> crate::error::Result<Option<CodexAuth>> {
+        if let Some(secret_key) = &self.experimental_bearer_token {
+            return Ok(Some(CodexAuth::from_api_key(secret_key)));
+        }
+
+        match self.api_key() {
+            Ok(Some(key)) => Ok(Some(CodexAuth::from_api_key(&key))),
+            Ok(None) => Ok(auth.clone()),
+            Err(err) => {
+                if auth.is_some() {
+                    Ok(auth.clone())
+                } else {
+                    Err(err)
                 }
             }
-        };
+        }
+    }
 
-        let url = self.get_full_url(&effective_auth);
-
+    async fn create_request_builder_with_resolved_url<'a>(
+        &'a self,
+        client: &'a CodexHttpClient,
+        effective_auth: Option<CodexAuth>,
+        url: String,
+    ) -> crate::error::Result<CodexRequestBuilder> {
         let mut builder = client.post(url);
 
         if let Some(auth) = effective_auth.as_ref() {
