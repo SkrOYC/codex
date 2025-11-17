@@ -19,6 +19,8 @@ use codex_core::protocol::PatchApplyEndEvent;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TaskCompleteEvent;
+use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::items::TurnItem;
 use codex_core::protocol::TurnAbortReason;
 use codex_core::protocol::TurnDiffEvent;
 use codex_core::protocol::WarningEvent;
@@ -527,9 +529,35 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             | EventMsg::ExitedReviewMode(_)
             | EventMsg::AgentMessageDelta(_)
             | EventMsg::AgentReasoningDelta(_)
-            | EventMsg::AgentReasoningRawContentDelta(_)
+            | EventMsg::AgentReasoningRawContentDelta(_) => {}
+            EventMsg::ItemCompleted(ItemCompletedEvent { item, .. }) => {
+                match item {
+                    TurnItem::AgentMessage(message) => {
+                        // Extract text from the first content item
+                        if let Some(content) = message.content.first() {
+                            let codex_protocol::items::AgentMessageContent::Text { text } = content;
+                            ts_msg!(
+                                self,
+                                "{}\n{}",
+                                "codex".style(self.italic).style(self.magenta),
+                                text,
+                            );
+                        }
+                    }
+                    TurnItem::Reasoning(reasoning) => {
+                        if self.show_agent_reasoning {
+                            ts_msg!(
+                                self,
+                                "{}\n{}",
+                                "thinking".style(self.italic).style(self.magenta),
+                                reasoning.summary_text.join("\n"),
+                            );
+                        }
+                    }
+                    _ => {} // Ignore other item types
+                }
+            }
             | EventMsg::ItemStarted(_)
-            | EventMsg::ItemCompleted(_)
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)

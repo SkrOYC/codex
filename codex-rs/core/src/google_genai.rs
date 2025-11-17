@@ -661,20 +661,45 @@ pub(crate) async fn stream_google_genai(
         match res {
             Ok(resp) if resp.status().is_success() => {
                 debug!("Google GenAI HTTP response successful: status={}", resp.status());
-                let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
-                let stream = resp.bytes_stream().map_err(|e| {
-                    CodexErr::ResponseStreamFailed(ResponseStreamFailed {
-                        source: e,
-                        request_id: None,
-                    })
-                });
 
-                tokio::spawn(process_google_genai_sse(
-                    stream,
-                    tx_event,
-                    provider.stream_idle_timeout(),
-                    otel_event_manager.clone(),
-                ));
+                let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
+
+                // Check if this is a streaming response or a direct JSON response
+                let content_type = resp.headers().get("content-type")
+                    .and_then(|ct| ct.to_str().ok())
+                    .unwrap_or("");
+
+                if content_type.contains("text/event-stream") {
+                    // Handle as SSE stream
+                    let stream = resp.bytes_stream().map_err(|e| {
+                        CodexErr::ResponseStreamFailed(ResponseStreamFailed {
+                            source: e,
+                            request_id: None,
+                        })
+                    });
+
+                    tokio::spawn(process_google_genai_sse(
+                        stream,
+                        tx_event,
+                        provider.stream_idle_timeout(),
+                        otel_event_manager.clone(),
+                    ));
+                } else {
+                    // Handle as direct JSON response
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(json_response) => {
+                            if let Err(e) = process_google_genai_json_response(json_response, &tx_event).await {
+                                let _ = tx_event.send(Err(e)).await;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx_event.send(Err(CodexErr::Stream(
+                                format!("Failed to parse JSON response: {}", e),
+                                None,
+                            ))).await;
+                        }
+                    }
+                }
 
                 return Ok(ResponseStream { rx_event });
             }
@@ -708,9 +733,7 @@ pub(crate) async fn stream_google_genai(
                     tokio::time::sleep(backoff(attempt)).await;
                     continue;
                 } else {
-                    return Err(CodexErr::ConnectionFailed(ConnectionFailedError {
-                        source: e,
-                    }));
+                    return Err(CodexErr::ConnectionFailed(ConnectionFailedError { source: e }));
                 }
             }
         }
@@ -722,6 +745,79 @@ pub(crate) async fn stream_google_genai(
         body: "Unexpected: loop ended without return".to_string(),
         request_id: None,
     }))
+}
+
+/// Processes a direct JSON response from Google GenAI (for non-streaming models).
+async fn process_google_genai_json_response(
+    response: serde_json::Value,
+    tx_event: &mpsc::Sender<Result<ResponseEvent>>,
+) -> std::result::Result<(), CodexErr> {
+    let mut next_function_call_index = 0;
+    let mut accumulated_text = String::new();
+
+    // Handle the case where response is an array (Google GenAI streaming returns arrays)
+    let response_objects = if response.is_array() {
+        response.as_array().unwrap_or(&vec![]).clone()
+    } else {
+        vec![response]
+    };
+
+    // Process each response object in the array and accumulate text
+    for response_obj in response_objects {
+        // Parse the Google GenAI response format
+        if let Some(candidates) = response_obj.get("candidates").and_then(|c| c.as_array()) {
+            for candidate in candidates {
+                if let Some(content) = candidate.get("content") {
+                    if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+                        for part in parts {
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                // Accumulate text from all chunks
+                                accumulated_text.push_str(text);
+                            }
+                            // Handle function calls (send immediately, don't accumulate)
+                            else if let Some(function_call) = part.get("functionCall") {
+                                if let (Some(name), Some(args)) = (
+                                    function_call.get("name").and_then(|n| n.as_str()),
+                                    function_call.get("args")
+                                ) {
+                                    let arguments = serde_json::to_string(&args)
+                                        .unwrap_or_else(|_| "{}".to_string());
+
+                                    let item = ResponseItem::FunctionCall {
+                                        id: None,
+                                        name: name.to_string(),
+                                        arguments,
+                                        call_id: format!("google_call_{}", next_function_call_index),
+                                    };
+                                    next_function_call_index += 1;
+                                    let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Send the accumulated text as a single response event
+    if !accumulated_text.is_empty() {
+        let response_item = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText { text: accumulated_text }],
+        };
+
+        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(response_item))).await;
+    }
+
+    // Send completion event
+    let _ = tx_event.send(Ok(ResponseEvent::Completed {
+        response_id: String::new(),
+        token_usage: None,
+    })).await;
+
+    Ok(())
 }
 
 /// Processes the SSE stream from Google GenAI and converts chunks to ResponseEvents.
@@ -759,6 +855,16 @@ async fn process_google_genai_sse<S>(
             }
             Ok(None) => {
                 // Stream closed gracefully
+                if assistant_item.is_none() {
+                    // If we get no events at all, it might be an error response
+                    let _ = tx_event
+                        .send(Err(CodexErr::Stream(
+                            "Google GenAI returned empty response - check model name and API key".into(),
+                            None,
+                        )))
+                        .await;
+                    return;
+                }
                 debug!("Google GenAI SSE stream closed gracefully");
                 finalize_google_response(&tx_event, &mut assistant_item).await;
 
