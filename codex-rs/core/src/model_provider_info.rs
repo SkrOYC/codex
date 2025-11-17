@@ -117,24 +117,54 @@ impl ModelProviderInfo {
         client: &'a CodexHttpClient,
         auth: &Option<CodexAuth>,
     ) -> crate::error::Result<CodexRequestBuilder> {
-        let effective_auth = if let Some(secret_key) = &self.experimental_bearer_token {
-            Some(CodexAuth::from_api_key(secret_key))
-        } else {
-            match self.api_key() {
-                Ok(Some(key)) => Some(CodexAuth::from_api_key(&key)),
-                Ok(None) => auth.clone(),
-                Err(err) => {
-                    if auth.is_some() {
-                        auth.clone()
-                    } else {
-                        return Err(err);
-                    }
-                }
-            }
-        };
-
+        let effective_auth = self.resolve_effective_auth(auth)?;
         let url = self.get_full_url(&effective_auth);
+        self.create_request_builder_with_resolved_url(client, effective_auth, url)
+            .await
+    }
 
+    /// Same as [`create_request_builder`] but allows the caller to specify the exact URL.
+    ///
+    /// Useful for providers like Google GenAI where the model slug must appear inside the path.
+    pub async fn create_request_builder_with_url<'a>(
+        &'a self,
+        client: &'a CodexHttpClient,
+        auth: &Option<CodexAuth>,
+        url: String,
+    ) -> crate::error::Result<CodexRequestBuilder> {
+        let effective_auth = self.resolve_effective_auth(auth)?;
+        self.create_request_builder_with_resolved_url(client, effective_auth, url)
+            .await
+    }
+
+    fn resolve_effective_auth(
+        &self,
+        auth: &Option<CodexAuth>,
+    ) -> crate::error::Result<Option<CodexAuth>> {
+        if let Some(secret_key) = &self.experimental_bearer_token {
+            return Ok(Some(CodexAuth::from_api_key(secret_key)));
+        }
+
+        let api_key = self.api_key()?;
+        if self.wire_api == WireApi::GoogleGenAI {
+            // Google GenAI requires API keys via `x-goog-api-key` (or `?key=`) instead of bearer auth.
+            // Ensure the env var is present (api_key()? above) but do not attach it as Authorization header.
+            return Ok(auth.clone());
+        }
+
+        if let Some(key) = api_key {
+            Ok(Some(CodexAuth::from_api_key(&key)))
+        } else {
+            Ok(auth.clone())
+        }
+    }
+
+    async fn create_request_builder_with_resolved_url<'a>(
+        &'a self,
+        client: &'a CodexHttpClient,
+        effective_auth: Option<CodexAuth>,
+        url: String,
+    ) -> crate::error::Result<CodexRequestBuilder> {
         let mut builder = client.post(url);
 
         if let Some(auth) = effective_auth.as_ref() {
@@ -443,12 +473,9 @@ pub fn create_anthropic_provider() -> ModelProviderInfo {
         wire_api: WireApi::AnthropicMessages,
         query_params: None,
         http_headers: Some(
-            [(
-                "anthropic-version".to_string(),
-                "2023-06-01".to_string(),
-            )]
-            .into_iter()
-            .collect(),
+            [("anthropic-version".to_string(), "2023-06-01".to_string())]
+                .into_iter()
+                .collect(),
         ),
         env_http_headers: Some(
             [("x-api-key".to_string(), "ANTHROPIC_API_KEY".to_string())]
@@ -478,6 +505,30 @@ fn matches_azure_responses_base_url(base_url: &str) -> bool {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::ffi::OsString;
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn test_deserialize_ollama_model_provider_toml() {
@@ -642,15 +693,14 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
         assert_eq!(provider.wire_api, WireApi::GoogleGenAI);
         assert_eq!(provider.name, "Google GenAI");
         assert!(provider.base_url.is_some());
-        assert!(provider
-            .base_url
-            .as_ref()
-            .unwrap()
-            .contains("generativelanguage.googleapis.com"));
-        assert_eq!(
-            provider.env_key,
-            Some("GOOGLE_GENAI_API_KEY".to_string())
+        assert!(
+            provider
+                .base_url
+                .as_ref()
+                .unwrap()
+                .contains("generativelanguage.googleapis.com")
         );
+        assert_eq!(provider.env_key, Some("GOOGLE_GENAI_API_KEY".to_string()));
         assert!(provider.env_key_instructions.is_some());
         assert_eq!(provider.requires_openai_auth, false);
 
@@ -664,17 +714,28 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
     }
 
     #[test]
+    fn test_google_genai_api_key_not_used_as_bearer() {
+        let _guard = EnvGuard::set("GOOGLE_GENAI_API_KEY", "dummy-key");
+        let provider = create_google_genai_provider();
+
+        let auth = provider.resolve_effective_auth(&None).unwrap();
+        assert!(auth.is_none());
+    }
+
+    #[test]
     fn test_anthropic_provider_creation() {
         let provider = create_anthropic_provider();
 
         assert_eq!(provider.wire_api, WireApi::AnthropicMessages);
         assert_eq!(provider.name, "Anthropic");
         assert!(provider.base_url.is_some());
-        assert!(provider
-            .base_url
-            .as_ref()
-            .unwrap()
-            .contains("api.anthropic.com"));
+        assert!(
+            provider
+                .base_url
+                .as_ref()
+                .unwrap()
+                .contains("api.anthropic.com")
+        );
         assert_eq!(provider.env_key, Some("ANTHROPIC_API_KEY".to_string()));
         assert!(provider.env_key_instructions.is_some());
         assert_eq!(provider.requires_openai_auth, false);
@@ -742,10 +803,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             serde_json::to_string(&WireApi::Responses).unwrap(),
             "\"responses\""
         );
-        assert_eq!(
-            serde_json::to_string(&WireApi::Chat).unwrap(),
-            "\"chat\""
-        );
+        assert_eq!(serde_json::to_string(&WireApi::Chat).unwrap(), "\"chat\"");
         assert_eq!(
             serde_json::to_string(&WireApi::GoogleGenAI).unwrap(),
             "\"google_genai\""

@@ -123,9 +123,9 @@ pub enum WireApi {
 ### Provider IDs and Configuration
 
 Built-in provider IDs (defined in `built_in_model_providers()`):
-- `openai` - OpenAI Responses API
-- `oss` - Local OSS/Ollama (Chat Completions)
-- `google_genai` - Google GenAI (configuration available, implementation pending)
+- `openai` - OpenAI Responses API ✅
+- `oss` - Local OSS/Ollama (Chat Completions) ✅
+- `google_genai` - Google GenAI (Generative Language API) ✅ **IMPLEMENTED**
 - `anthropic` - Anthropic Messages API (configuration available, implementation pending)
 
 ### Environment Variables
@@ -144,8 +144,15 @@ Built-in provider IDs (defined in `built_in_model_providers()`):
 ```toml
 # ~/.codex/config.toml
 model_provider = "google_genai"
-model = "gemini-1.5-pro"
+model = "gemini-2.0-flash"  # or gemini-1.5-pro, gemini-1.5-flash, etc.
 ```
+
+Set the API key:
+```bash
+export GOOGLE_GENAI_API_KEY="your-api-key-from-ai-studio"
+```
+
+Get your API key from: https://aistudio.google.com/app/apikey
 
 **Using Anthropic:**
 ```toml
@@ -164,9 +171,19 @@ model = "claude-3-5-sonnet-20241022"
 - Comprehensive unit tests added
 - Documentation updated
 
-**Provider Implementations (⏳ PENDING):**
-- Google GenAI request/response mapping (separate issue)
-- Anthropic Messages request/response mapping (separate issue)
+**Google GenAI Provider (✅ COMPLETED):**
+- Full request/response mapping implementation
+- Streaming SSE support
+- Function calling (tool use)
+- Multi-turn conversations
+- Token usage reporting
+- Error handling and retries
+- Comprehensive unit tests (14 test cases)
+- Complete documentation in [google_genai_mapping.md](./google_genai_mapping.md)
+
+**Anthropic Messages Provider (⏳ PENDING):**
+- Request/response mapping (separate issue)
+- Streaming support (separate issue)
 
 ### Technical Details
 
@@ -179,26 +196,49 @@ model = "claude-3-5-sonnet-20241022"
 - Anthropic: Uses `x-api-key` header from environment, plus static `anthropic-version: 2023-06-01` header
 
 **Error Handling:**
-When using new providers before full implementation, users receive a clear error message:
-```
-Google GenAI provider is not yet fully implemented.
-The provider configuration is available for testing, but request/response
-mapping will be added in a future release.
-```
+- Google GenAI: Fully operational with retry logic and proper error messages
+- Anthropic: Placeholder error message until implementation is complete:
+  ```
+  Anthropic Messages provider is not yet fully implemented.
+  The provider configuration is available for testing, but request/response
+  mapping will be added in a future release.
+  ```
+
+## Google GenAI Implementation
+
+The Google GenAI provider is now fully integrated and operational. See [google_genai_mapping.md](./google_genai_mapping.md) for:
+- Complete request/response mapping documentation
+- Supported features and limitations
+- Configuration examples
+- Troubleshooting guide
+- API reference
+
+**Key Files:**
+- Implementation: `codex-rs/core/src/google_genai.rs`
+- Tests: 14 comprehensive unit tests in the same file
+- Integration: `codex-rs/core/src/client.rs` (WireApi::GoogleGenAI branch)
+- Module export: `codex-rs/core/src/lib.rs`
 
 ## Next Steps
 
+**For Anthropic Integration:**
 See the main research report in the parent directory or the comprehensive analysis above for:
 - Detailed API specifications
 - Request/response format differences
-- Implementation roadmap for Google GenAI adapter
 - Implementation roadmap for Anthropic adapter
 - Configuration examples
 - Security considerations
 
+**For Google GenAI Users:**
+- Refer to [google_genai_mapping.md](./google_genai_mapping.md) for usage documentation
+- Run tests: `cargo test -p codex-core google_genai`
+- Set up your API key: `export GOOGLE_GENAI_API_KEY="..."`
+- Configure in `~/.codex/config.toml` with `model_provider = "google_genai"`
+
 ---
 
 **Generated:** 2025-11-17
-**Research Phase:** Complete
+**Research Phase:** Complete ✅
 **Core Design Phase:** Complete ✅
-**Status:** Ready for provider-specific implementation
+**Google GenAI Implementation:** Complete ✅
+**Status:** Google GenAI ready for production use; Anthropic pending implementation
