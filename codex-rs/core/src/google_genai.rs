@@ -32,9 +32,10 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value as JsonValue;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::debug;
@@ -262,7 +263,8 @@ pub(crate) fn build_google_genai_request(
                 let mut text = String::new();
                 for c in content {
                     match c {
-                        ContentItem::InputText { text: t } | ContentItem::OutputText { text: t } => {
+                        ContentItem::InputText { text: t }
+                        | ContentItem::OutputText { text: t } => {
                             text.push_str(t);
                         }
                         ContentItem::InputImage { .. } => {
@@ -278,7 +280,7 @@ pub(crate) fn build_google_genai_request(
                     let google_role = match role.as_str() {
                         "user" => "user",
                         "assistant" => "model", // Google uses "model" instead of "assistant"
-                        _ => "user", // Default to user for safety
+                        _ => "user",            // Default to user for safety
                     };
 
                     contents.push(GoogleGenAiContent {
@@ -298,8 +300,7 @@ pub(crate) fn build_google_genai_request(
                 ..
             } => {
                 // Parse arguments string to JSON
-                let args: JsonValue = serde_json::from_str(arguments)
-                    .unwrap_or_else(|_| json!({}));
+                let args: JsonValue = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
 
                 contents.push(GoogleGenAiContent {
                     role: "model".to_string(),
@@ -540,10 +541,10 @@ async fn process_google_genai_sse<S>(
 {
     let mut stream = stream.eventsource();
 
-    // State to accumulate assistant message content
-    let mut current_text = String::new();
-    let mut current_function_calls: Vec<GoogleGenAiFunctionCall> = Vec::new();
-    let mut has_content = false;
+    // Track the streamed assistant message so we can emit deltas and
+    // finalize it once the turn is complete.
+    let mut assistant_item: Option<ResponseItem> = None;
+    let mut next_function_call_index = 0usize;
 
     loop {
         let start = std::time::Instant::now();
@@ -561,7 +562,7 @@ async fn process_google_genai_sse<S>(
             }
             Ok(None) => {
                 // Stream closed gracefully
-                finalize_google_response(&tx_event, &current_text, &current_function_calls).await;
+                finalize_google_response(&tx_event, &mut assistant_item).await;
 
                 let _ = tx_event
                     .send(Ok(ResponseEvent::Completed {
@@ -586,7 +587,10 @@ async fn process_google_genai_sse<S>(
         let chunk: GoogleGenAiStreamChunk = match serde_json::from_str(&sse.data) {
             Ok(v) => v,
             Err(e) => {
-                trace!("Failed to parse Google GenAI SSE chunk: {}, data: {}", e, sse.data);
+                trace!(
+                    "Failed to parse Google GenAI SSE chunk: {}, data: {}",
+                    e, sse.data
+                );
                 continue;
             }
         };
@@ -600,8 +604,24 @@ async fn process_google_genai_sse<S>(
                     // Handle text parts
                     if let Some(text) = &part.text {
                         if !text.is_empty() {
-                            has_content = true;
-                            current_text.push_str(text);
+                            if assistant_item.is_none() {
+                                let item = ResponseItem::Message {
+                                    id: None,
+                                    role: "assistant".to_string(),
+                                    content: vec![],
+                                };
+                                let cloned = item.clone();
+                                assistant_item = Some(item);
+                                let _ = tx_event
+                                    .send(Ok(ResponseEvent::OutputItemAdded(cloned)))
+                                    .await;
+                            }
+
+                            if let Some(ResponseItem::Message { content, .. }) =
+                                assistant_item.as_mut()
+                            {
+                                content.push(ContentItem::OutputText { text: text.clone() });
+                            }
 
                             // Send text delta
                             let _ = tx_event
@@ -610,23 +630,35 @@ async fn process_google_genai_sse<S>(
                         }
                     }
 
-                    // Handle function calls
+                    // Handle function calls immediately.
                     if let Some(function_call) = &part.function_call {
-                        has_content = true;
-                        current_function_calls.push(function_call.clone());
+                        let arguments = serde_json::to_string(
+                            &function_call.args.as_ref().unwrap_or(&json!({})),
+                        )
+                        .unwrap_or_else(|_| "{}".to_string());
+
+                        let item = ResponseItem::FunctionCall {
+                            id: None,
+                            name: function_call.name.clone(),
+                            arguments,
+                            call_id: format!("google_call_{}", next_function_call_index),
+                        };
+                        next_function_call_index += 1;
+                        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                     }
                 }
             }
 
             // Check if this is the final chunk
             if candidate.finish_reason.is_some() {
-                finalize_google_response(&tx_event, &current_text, &current_function_calls).await;
+                finalize_google_response(&tx_event, &mut assistant_item).await;
 
                 // Send completion event with usage metadata if available
                 let token_usage = chunk.usage_metadata.as_ref().map(|usage| {
                     let input_tokens = usage.prompt_token_count.unwrap_or(0) as i64;
                     let output_tokens = usage.candidates_token_count.unwrap_or(0) as i64;
-                    let total = usage.total_token_count
+                    let total = usage
+                        .total_token_count
                         .map(|t| t as i64)
                         .unwrap_or(input_tokens + output_tokens);
                     codex_protocol::protocol::TokenUsage {
@@ -653,33 +685,10 @@ async fn process_google_genai_sse<S>(
 /// Helper to finalize and send the accumulated response content.
 async fn finalize_google_response(
     tx_event: &mpsc::Sender<Result<ResponseEvent>>,
-    text: &str,
-    function_calls: &[GoogleGenAiFunctionCall],
+    assistant_item: &mut Option<ResponseItem>,
 ) {
-    // Send assistant message if we have text
-    if !text.is_empty() {
-        let item = ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: text.to_string(),
-            }],
-        };
+    if let Some(item) = assistant_item.take() {
         let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-    }
-
-    // Send function calls if any
-    for (idx, function_call) in function_calls.iter().enumerate() {
-        let arguments = serde_json::to_string(&function_call.args.as_ref().unwrap_or(&json!({})))
-            .unwrap_or_else(|_| "{}".to_string());
-
-        let item = ResponseItem::FunctionCall {
-            id: None,
-            name: function_call.name.clone(),
-            arguments,
-            call_id: format!("google_call_{}", idx),
-        };
-        let _ = tx_event.send(Ok(ResponseEvent::OutputItemAdded(item))).await;
     }
 }
 
@@ -690,11 +699,19 @@ async fn finalize_google_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_protocol::models::{ContentItem, FunctionCallOutputPayload};
-    use crate::client_common::tools::{FreeformTool, FreeformToolFormat, ResponsesApiTool};
-    use crate::tools::spec::{JsonSchema, ConfigShellToolType};
+    use crate::client_common::tools::FreeformTool;
+    use crate::client_common::tools::FreeformToolFormat;
+    use crate::client_common::tools::ResponsesApiTool;
     use crate::config::types::ReasoningSummaryFormat;
+    use crate::tools::spec::ConfigShellToolType;
+    use crate::tools::spec::JsonSchema;
+    use codex_app_server_protocol::AuthMode;
+    use codex_protocol::ConversationId;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use futures::stream;
     use std::collections::BTreeMap;
+    use tokio::time::Duration;
 
     fn create_test_model_family() -> ModelFamily {
         ModelFamily {
@@ -1057,11 +1074,103 @@ mod tests {
     fn test_parse_malformed_chunk() {
         let chunk_json = r#"{"invalid": "json"}"#;
 
-        let result: std::result::Result<GoogleGenAiStreamChunk, _> = serde_json::from_str(chunk_json);
+        let result: std::result::Result<GoogleGenAiStreamChunk, _> =
+            serde_json::from_str(chunk_json);
 
         // Should still parse but have empty candidates
         assert!(result.is_ok());
         let chunk = result.unwrap();
         assert_eq!(chunk.candidates.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_stream_emits_assistant_item_before_deltas() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let text_chunk =
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}"#;
+        let done_chunk = r#"{"candidates":[{"finishReason":"STOP"}]}"#;
+
+        process_google_genai_sse(
+            stream::iter(vec![
+                Ok(Bytes::from(format!("data: {text_chunk}\n\n"))),
+                Ok(Bytes::from(format!("data: {done_chunk}\n\n"))),
+            ]),
+            tx,
+            Duration::from_secs(1),
+            test_otel_event_manager(),
+        )
+        .await;
+
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputItemAdded(ResponseItem::Message { role, content, .. }) => {
+                assert_eq!(role, "assistant");
+                assert!(content.is_empty());
+            }
+            other => panic!("expected OutputItemAdded for assistant, got {other:?}"),
+        }
+
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputTextDelta(delta) => assert_eq!(delta, "Hello"),
+            other => panic!("expected OutputTextDelta, got {other:?}"),
+        }
+
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputItemDone(ResponseItem::Message { role, content, .. }) => {
+                assert_eq!(role, "assistant");
+                assert_eq!(content.len(), 1);
+            }
+            other => panic!("expected OutputItemDone for assistant, got {other:?}"),
+        }
+
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::Completed { .. } => {}
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_function_call_emitted_immediately() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let call_chunk = r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{"city":"Paris"}}}]}}]}"#;
+        let done_chunk = r#"{"candidates":[{"finishReason":"STOP"}]}"#;
+
+        process_google_genai_sse(
+            stream::iter(vec![
+                Ok(Bytes::from(format!("data: {call_chunk}\n\n"))),
+                Ok(Bytes::from(format!("data: {done_chunk}\n\n"))),
+            ]),
+            tx,
+            Duration::from_secs(1),
+            test_otel_event_manager(),
+        )
+        .await;
+
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name, arguments, ..
+            }) => {
+                assert_eq!(name, "lookup");
+                assert_eq!(arguments, r#"{"city":"Paris"}"#);
+            }
+            other => panic!("expected immediate FunctionCall, got {other:?}"),
+        }
+
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::Completed { .. } => {}
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    fn test_otel_event_manager() -> OtelEventManager {
+        OtelEventManager::new(
+            ConversationId::new(),
+            "test-model",
+            "test-slug",
+            None,
+            None,
+            None::<AuthMode>,
+            false,
+            "test".to_string(),
+        )
     }
 }

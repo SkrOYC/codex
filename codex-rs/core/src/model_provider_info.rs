@@ -443,12 +443,9 @@ pub fn create_anthropic_provider() -> ModelProviderInfo {
         wire_api: WireApi::AnthropicMessages,
         query_params: None,
         http_headers: Some(
-            [(
-                "anthropic-version".to_string(),
-                "2023-06-01".to_string(),
-            )]
-            .into_iter()
-            .collect(),
+            [("anthropic-version".to_string(), "2023-06-01".to_string())]
+                .into_iter()
+                .collect(),
         ),
         env_http_headers: Some(
             [("x-api-key".to_string(), "ANTHROPIC_API_KEY".to_string())]
@@ -642,15 +639,14 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
         assert_eq!(provider.wire_api, WireApi::GoogleGenAI);
         assert_eq!(provider.name, "Google GenAI");
         assert!(provider.base_url.is_some());
-        assert!(provider
-            .base_url
-            .as_ref()
-            .unwrap()
-            .contains("generativelanguage.googleapis.com"));
-        assert_eq!(
-            provider.env_key,
-            Some("GOOGLE_GENAI_API_KEY".to_string())
+        assert!(
+            provider
+                .base_url
+                .as_ref()
+                .unwrap()
+                .contains("generativelanguage.googleapis.com")
         );
+        assert_eq!(provider.env_key, Some("GOOGLE_GENAI_API_KEY".to_string()));
         assert!(provider.env_key_instructions.is_some());
         assert_eq!(provider.requires_openai_auth, false);
 
@@ -670,11 +666,13 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
         assert_eq!(provider.wire_api, WireApi::AnthropicMessages);
         assert_eq!(provider.name, "Anthropic");
         assert!(provider.base_url.is_some());
-        assert!(provider
-            .base_url
-            .as_ref()
-            .unwrap()
-            .contains("api.anthropic.com"));
+        assert!(
+            provider
+                .base_url
+                .as_ref()
+                .unwrap()
+                .contains("api.anthropic.com")
+        );
         assert_eq!(provider.env_key, Some("ANTHROPIC_API_KEY".to_string()));
         assert!(provider.env_key_instructions.is_some());
         assert_eq!(provider.requires_openai_auth, false);
@@ -742,10 +740,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             serde_json::to_string(&WireApi::Responses).unwrap(),
             "\"responses\""
         );
-        assert_eq!(
-            serde_json::to_string(&WireApi::Chat).unwrap(),
-            "\"chat\""
-        );
+        assert_eq!(serde_json::to_string(&WireApi::Chat).unwrap(), "\"chat\"");
         assert_eq!(
             serde_json::to_string(&WireApi::GoogleGenAI).unwrap(),
             "\"google_genai\""
