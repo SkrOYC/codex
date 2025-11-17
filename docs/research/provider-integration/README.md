@@ -103,12 +103,96 @@ This directory contains research and analysis documentation for implementing dir
 | **Message Format** | `{role, content}` | `{role, parts: [{text}]}` | `{role, content}` |
 | **Tool Format** | `parameters` | `parametersJsonSchema` | `input_schema` |
 
+## Core Design Implementation
+
+### WireApi Extension (COMPLETED)
+
+The `WireApi` enum has been extended with two new variants in `codex-rs/core/src/model_provider_info.rs`:
+- `GoogleGenAI`: For Google Generative Language API (Gemini models)
+- `AnthropicMessages`: For Anthropic Messages API (Claude models)
+
+```rust
+pub enum WireApi {
+    Responses,           // OpenAI Responses API
+    Chat,               // Chat Completions API
+    GoogleGenAI,        // Google GenAI API
+    AnthropicMessages,  // Anthropic Messages API
+}
+```
+
+### Provider IDs and Configuration
+
+Built-in provider IDs (defined in `built_in_model_providers()`):
+- `openai` - OpenAI Responses API
+- `oss` - Local OSS/Ollama (Chat Completions)
+- `google_genai` - Google GenAI (configuration available, implementation pending)
+- `anthropic` - Anthropic Messages API (configuration available, implementation pending)
+
+### Environment Variables
+
+**Google GenAI:**
+- `GOOGLE_GENAI_API_KEY` - Required API key (passed via `x-goog-api-key` header)
+- `GOOGLE_GENAI_BASE_URL` - Optional base URL override (default: `https://generativelanguage.googleapis.com/v1beta`)
+
+**Anthropic:**
+- `ANTHROPIC_API_KEY` - Required API key (passed via `x-api-key` header)
+- `ANTHROPIC_BASE_URL` - Optional base URL override (default: `https://api.anthropic.com/v1`)
+
+### Provider Configuration Examples
+
+**Using Google GenAI:**
+```toml
+# ~/.codex/config.toml
+model_provider = "google_genai"
+model = "gemini-1.5-pro"
+```
+
+**Using Anthropic:**
+```toml
+# ~/.codex/config.toml
+model_provider = "anthropic"
+model = "claude-3-5-sonnet-20241022"
+```
+
+### Implementation Status
+
+**Core Design (✅ COMPLETED):**
+- WireApi enum extended with new variants
+- Provider factory functions implemented (`create_google_genai_provider()`, `create_anthropic_provider()`)
+- Built-in providers registry updated
+- ModelClient routing extended with placeholder error handling
+- Comprehensive unit tests added
+- Documentation updated
+
+**Provider Implementations (⏳ PENDING):**
+- Google GenAI request/response mapping (separate issue)
+- Anthropic Messages request/response mapping (separate issue)
+
+### Technical Details
+
+**URL Construction:**
+- Google GenAI: `{base_url}/models/{model}:streamGenerateContent`
+- Anthropic: `{base_url}/messages`
+
+**Authentication:**
+- Google GenAI: Uses `x-goog-api-key` header from environment
+- Anthropic: Uses `x-api-key` header from environment, plus static `anthropic-version: 2023-06-01` header
+
+**Error Handling:**
+When using new providers before full implementation, users receive a clear error message:
+```
+Google GenAI provider is not yet fully implemented.
+The provider configuration is available for testing, but request/response
+mapping will be added in a future release.
+```
+
 ## Next Steps
 
 See the main research report in the parent directory or the comprehensive analysis above for:
 - Detailed API specifications
 - Request/response format differences
-- Implementation roadmap
+- Implementation roadmap for Google GenAI adapter
+- Implementation roadmap for Anthropic adapter
 - Configuration examples
 - Security considerations
 
@@ -116,4 +200,5 @@ See the main research report in the parent directory or the comprehensive analys
 
 **Generated:** 2025-11-17
 **Research Phase:** Complete
-**Status:** Ready for implementation planning
+**Core Design Phase:** Complete ✅
+**Status:** Ready for provider-specific implementation

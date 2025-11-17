@@ -39,6 +39,14 @@ pub enum WireApi {
     /// Regular Chat Completions compatible with `/v1/chat/completions`.
     #[default]
     Chat,
+
+    /// Google Generative Language API (Gemini) at `/v1beta/models/{model}:streamGenerateContent`.
+    #[serde(rename = "google_genai")]
+    GoogleGenAI,
+
+    /// Anthropic Messages API (Claude) at `/v1/messages`.
+    #[serde(rename = "anthropic_messages")]
+    AnthropicMessages,
 }
 
 /// Serializable representation of a provider definition.
@@ -170,6 +178,13 @@ impl ModelProviderInfo {
         match self.wire_api {
             WireApi::Responses => format!("{base_url}/responses{query_string}"),
             WireApi::Chat => format!("{base_url}/chat/completions{query_string}"),
+            WireApi::GoogleGenAI => {
+                // Note: Google GenAI requires the model name in the URL path.
+                // This placeholder will need to be replaced with the actual model name
+                // when the full implementation is added.
+                format!("{base_url}/models/{{model}}:streamGenerateContent{query_string}")
+            }
+            WireApi::AnthropicMessages => format!("{base_url}/messages{query_string}"),
         }
     }
 
@@ -261,15 +276,16 @@ impl ModelProviderInfo {
 const DEFAULT_OLLAMA_PORT: u32 = 11434;
 
 pub const BUILT_IN_OSS_MODEL_PROVIDER_ID: &str = "oss";
+pub const BUILT_IN_GOOGLE_GENAI_MODEL_PROVIDER_ID: &str = "google_genai";
+pub const BUILT_IN_ANTHROPIC_MODEL_PROVIDER_ID: &str = "anthropic";
 
 /// Built-in default provider list.
 pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
     use ModelProviderInfo as P;
 
-    // We do not want to be in the business of adjucating which third-party
-    // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
+    // We include OpenAI, OSS (Ollama), Google GenAI, and Anthropic as built-in providers
+    // to provide first-class support for major LLM providers. Users can add additional
+    // providers in `model_providers` in config.toml.
     [
         (
             "openai",
@@ -312,6 +328,14 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
             },
         ),
         (BUILT_IN_OSS_MODEL_PROVIDER_ID, create_oss_provider()),
+        (
+            BUILT_IN_GOOGLE_GENAI_MODEL_PROVIDER_ID,
+            create_google_genai_provider(),
+        ),
+        (
+            BUILT_IN_ANTHROPIC_MODEL_PROVIDER_ID,
+            create_anthropic_provider(),
+        ),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -350,6 +374,87 @@ pub fn create_oss_provider_with_base_url(base_url: &str) -> ModelProviderInfo {
         query_params: None,
         http_headers: None,
         env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        requires_openai_auth: false,
+    }
+}
+
+/// Creates a Google GenAI provider configuration.
+///
+/// Google GenAI uses the Generative Language API with Gemini models.
+/// Authentication is via API key passed in the `x-goog-api-key` header.
+///
+/// Environment variables:
+/// - `GOOGLE_GENAI_API_KEY`: Required API key for authentication
+/// - `GOOGLE_GENAI_BASE_URL`: Optional base URL override (defaults to generativelanguage.googleapis.com)
+pub fn create_google_genai_provider() -> ModelProviderInfo {
+    ModelProviderInfo {
+        name: "Google GenAI".into(),
+        base_url: std::env::var("GOOGLE_GENAI_BASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| Some("https://generativelanguage.googleapis.com/v1beta".to_string())),
+        env_key: Some("GOOGLE_GENAI_API_KEY".into()),
+        env_key_instructions: Some(
+            "Get your API key from https://aistudio.google.com/app/apikey".into(),
+        ),
+        experimental_bearer_token: None,
+        wire_api: WireApi::GoogleGenAI,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: Some(
+            [(
+                "x-goog-api-key".to_string(),
+                "GOOGLE_GENAI_API_KEY".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        requires_openai_auth: false,
+    }
+}
+
+/// Creates an Anthropic provider configuration.
+///
+/// Anthropic uses the Messages API with Claude models.
+/// Authentication is via API key passed in the `x-api-key` header.
+/// The API also requires an `anthropic-version` header for API versioning.
+///
+/// Environment variables:
+/// - `ANTHROPIC_API_KEY`: Required API key for authentication
+/// - `ANTHROPIC_BASE_URL`: Optional base URL override (defaults to api.anthropic.com)
+pub fn create_anthropic_provider() -> ModelProviderInfo {
+    ModelProviderInfo {
+        name: "Anthropic".into(),
+        base_url: std::env::var("ANTHROPIC_BASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| Some("https://api.anthropic.com/v1".to_string())),
+        env_key: Some("ANTHROPIC_API_KEY".into()),
+        env_key_instructions: Some(
+            "Get your API key from https://console.anthropic.com/settings/keys".into(),
+        ),
+        experimental_bearer_token: None,
+        wire_api: WireApi::AnthropicMessages,
+        query_params: None,
+        http_headers: Some(
+            [(
+                "anthropic-version".to_string(),
+                "2023-06-01".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        env_http_headers: Some(
+            [("x-api-key".to_string(), "ANTHROPIC_API_KEY".to_string())]
+                .into_iter()
+                .collect(),
+        ),
         request_max_retries: None,
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
@@ -528,5 +633,147 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
                 "expected {base_url} not to be detected as Azure"
             );
         }
+    }
+
+    #[test]
+    fn test_google_genai_provider_creation() {
+        let provider = create_google_genai_provider();
+
+        assert_eq!(provider.wire_api, WireApi::GoogleGenAI);
+        assert_eq!(provider.name, "Google GenAI");
+        assert!(provider.base_url.is_some());
+        assert!(provider
+            .base_url
+            .as_ref()
+            .unwrap()
+            .contains("generativelanguage.googleapis.com"));
+        assert_eq!(
+            provider.env_key,
+            Some("GOOGLE_GENAI_API_KEY".to_string())
+        );
+        assert!(provider.env_key_instructions.is_some());
+        assert_eq!(provider.requires_openai_auth, false);
+
+        // Verify env_http_headers contains x-goog-api-key
+        assert!(provider.env_http_headers.is_some());
+        let env_headers = provider.env_http_headers.unwrap();
+        assert_eq!(
+            env_headers.get("x-goog-api-key"),
+            Some(&"GOOGLE_GENAI_API_KEY".to_string())
+        );
+    }
+
+    #[test]
+    fn test_anthropic_provider_creation() {
+        let provider = create_anthropic_provider();
+
+        assert_eq!(provider.wire_api, WireApi::AnthropicMessages);
+        assert_eq!(provider.name, "Anthropic");
+        assert!(provider.base_url.is_some());
+        assert!(provider
+            .base_url
+            .as_ref()
+            .unwrap()
+            .contains("api.anthropic.com"));
+        assert_eq!(provider.env_key, Some("ANTHROPIC_API_KEY".to_string()));
+        assert!(provider.env_key_instructions.is_some());
+        assert_eq!(provider.requires_openai_auth, false);
+
+        // Verify http_headers contains anthropic-version
+        assert!(provider.http_headers.is_some());
+        let headers = provider.http_headers.as_ref().unwrap();
+        assert_eq!(
+            headers.get("anthropic-version"),
+            Some(&"2023-06-01".to_string())
+        );
+
+        // Verify env_http_headers contains x-api-key
+        assert!(provider.env_http_headers.is_some());
+        let env_headers = provider.env_http_headers.unwrap();
+        assert_eq!(
+            env_headers.get("x-api-key"),
+            Some(&"ANTHROPIC_API_KEY".to_string())
+        );
+    }
+
+    #[test]
+    fn test_url_construction_for_google_genai() {
+        let provider = create_google_genai_provider();
+        let url = provider.get_full_url(&None);
+
+        assert!(url.contains("generativelanguage.googleapis.com"));
+        assert!(url.contains("/v1beta/models/{model}:streamGenerateContent"));
+    }
+
+    #[test]
+    fn test_url_construction_for_anthropic() {
+        let provider = create_anthropic_provider();
+        let url = provider.get_full_url(&None);
+
+        assert!(url.contains("api.anthropic.com"));
+        assert!(url.ends_with("/messages"));
+    }
+
+    #[test]
+    fn test_built_in_providers_include_new_providers() {
+        let providers = built_in_model_providers();
+
+        // Verify all built-in providers are present
+        assert!(providers.contains_key("openai"));
+        assert!(providers.contains_key("oss"));
+        assert!(providers.contains_key("google_genai"));
+        assert!(providers.contains_key("anthropic"));
+
+        // Verify the new providers have correct wire_api
+        assert_eq!(
+            providers.get("google_genai").unwrap().wire_api,
+            WireApi::GoogleGenAI
+        );
+        assert_eq!(
+            providers.get("anthropic").unwrap().wire_api,
+            WireApi::AnthropicMessages
+        );
+    }
+
+    #[test]
+    fn test_wire_api_serialization() {
+        // Test that WireApi variants serialize correctly for config
+        assert_eq!(
+            serde_json::to_string(&WireApi::Responses).unwrap(),
+            "\"responses\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WireApi::Chat).unwrap(),
+            "\"chat\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WireApi::GoogleGenAI).unwrap(),
+            "\"google_genai\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WireApi::AnthropicMessages).unwrap(),
+            "\"anthropic_messages\""
+        );
+    }
+
+    #[test]
+    fn test_wire_api_deserialization() {
+        // Test that WireApi variants deserialize correctly from config
+        assert_eq!(
+            serde_json::from_str::<WireApi>("\"responses\"").unwrap(),
+            WireApi::Responses
+        );
+        assert_eq!(
+            serde_json::from_str::<WireApi>("\"chat\"").unwrap(),
+            WireApi::Chat
+        );
+        assert_eq!(
+            serde_json::from_str::<WireApi>("\"google_genai\"").unwrap(),
+            WireApi::GoogleGenAI
+        );
+        assert_eq!(
+            serde_json::from_str::<WireApi>("\"anthropic_messages\"").unwrap(),
+            WireApi::AnthropicMessages
+        );
     }
 }
