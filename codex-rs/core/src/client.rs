@@ -180,6 +180,18 @@ impl ModelClient {
 
                 Ok(ResponseStream { rx_event: rx })
             }
+            WireApi::GoogleGenAI => Err(CodexErr::UnsupportedOperation(
+                "Google GenAI provider is not yet fully implemented. \
+                 The provider configuration is available for testing, but request/response \
+                 mapping will be added in a future release."
+                    .to_string(),
+            )),
+            WireApi::AnthropicMessages => Err(CodexErr::UnsupportedOperation(
+                "Anthropic Messages provider is not yet fully implemented. \
+                 The provider configuration is available for testing, but request/response \
+                 mapping will be added in a future release."
+                    .to_string(),
+            )),
         }
     }
 
