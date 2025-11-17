@@ -28,6 +28,25 @@ pub const REVIEW_EXIT_SUCCESS_TMPL: &str = include_str!("../templates/review/exi
 pub const REVIEW_EXIT_INTERRUPTED_TMPL: &str =
     include_str!("../templates/review/exit_interrupted.xml");
 
+/// Configuration parameters for content generation.
+#[derive(Default, Debug, Clone)]
+pub struct GenerationConfig {
+    /// Controls randomness in generation (0.0 to 2.0)
+    pub temperature: Option<f32>,
+    /// Nucleus sampling parameter (0.0 to 1.0)
+    pub top_p: Option<f32>,
+    /// Maximum response length in tokens
+    pub max_tokens: Option<u32>,
+    /// Stop sequences array
+    pub stop_sequences: Option<Vec<String>>,
+    /// Penalize new tokens based on presence (-2.0 to 2.0)
+    pub presence_penalty: Option<f32>,
+    /// Penalize new tokens based on frequency (-2.0 to 2.0)
+    pub frequency_penalty: Option<f32>,
+    /// For reproducible outputs
+    pub seed: Option<u64>,
+}
+
 /// API request payload for a single model turn
 #[derive(Default, Debug, Clone)]
 pub struct Prompt {
@@ -46,6 +65,9 @@ pub struct Prompt {
 
     /// Optional the output schema for the model's response.
     pub output_schema: Option<Value>,
+
+    /// Optional generation configuration parameters.
+    pub generation_config: Option<GenerationConfig>,
 }
 
 impl Prompt {
@@ -550,5 +572,29 @@ mod tests {
 
         let v = serde_json::to_value(&req).expect("json");
         assert!(v.get("text").is_none());
+    }
+
+    #[test]
+    fn serializes_generation_config() {
+        let config = GenerationConfig {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_tokens: Some(100),
+            stop_sequences: Some(vec!["stop".to_string()]),
+            presence_penalty: Some(0.1),
+            frequency_penalty: Some(0.2),
+            seed: Some(42),
+        };
+
+        let json = serde_json::to_string(&config).expect("serialize");
+        let deserialized: GenerationConfig = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deserialized.temperature, Some(0.7));
+        assert_eq!(deserialized.top_p, Some(0.9));
+        assert_eq!(deserialized.max_tokens, Some(100));
+        assert_eq!(deserialized.stop_sequences, Some(vec!["stop".to_string()]));
+        assert_eq!(deserialized.presence_penalty, Some(0.1));
+        assert_eq!(deserialized.frequency_penalty, Some(0.2));
+        assert_eq!(deserialized.seed, Some(42));
     }
 }
