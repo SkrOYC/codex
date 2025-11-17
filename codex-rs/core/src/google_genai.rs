@@ -134,6 +134,10 @@ pub struct GoogleGenAiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<GoogleGenAiTool>>,
 
+    /// Optional tool configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<GoogleGenAiToolConfig>,
+
     /// Optional generation configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<GoogleGenAiGenerationConfig>,
@@ -162,6 +166,26 @@ pub struct GoogleGenAiGenerationConfig {
     /// Stop sequences for generation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
+}
+
+/// Configuration for tool usage.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleGenAiToolConfig {
+    /// Function calling configuration
+    pub function_calling_config: GoogleGenAiFunctionCallingConfig,
+}
+
+/// Configuration for function calling behavior.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleGenAiFunctionCallingConfig {
+    /// The mode for function calling (AUTO, ANY, NONE, etc.)
+    pub mode: String,
+
+    /// Optional list of allowed function names
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_function_names: Option<Vec<String>>,
 }
 
 // ============================================================================
@@ -395,13 +419,22 @@ pub(crate) fn build_google_genai_request(
             .iter()
             .filter_map(|tool| match tool {
                 ToolSpec::Function(func) => {
-                    // Convert JsonSchema to JsonValue
+                    // Convert JsonSchema to JsonValue and validate
                     let parameters_json = serde_json::to_value(&func.parameters).ok();
-                    Some(GoogleGenAiFunctionDeclaration {
-                        name: func.name.clone(),
-                        description: func.description.clone(),
-                        parameters: parameters_json,
-                    })
+                    if let Some(params) = &parameters_json {
+                        if !is_valid_json_schema(params) {
+                            // Skip invalid schemas
+                            None
+                        } else {
+                            Some(GoogleGenAiFunctionDeclaration {
+                                name: func.name.clone(),
+                                description: func.description.clone(),
+                                parameters: parameters_json,
+                            })
+                        }
+                    } else {
+                        None
+                    }
                 }
                 ToolSpec::Freeform(func) => {
                     // For freeform tools, create a basic schema from the format definition
@@ -410,17 +443,29 @@ pub(crate) fn build_google_genai_request(
                         "type": "object",
                         "description": func.format.definition.clone(),
                     });
-                    Some(GoogleGenAiFunctionDeclaration {
-                        name: func.name.clone(),
-                        description: func.description.clone(),
-                        parameters: Some(parameters_json),
-                    })
+                    if is_valid_json_schema(&parameters_json) {
+                        Some(GoogleGenAiFunctionDeclaration {
+                            name: func.name.clone(),
+                            description: func.description.clone(),
+                            parameters: Some(parameters_json),
+                        })
+                    } else {
+                        None
+                    }
                 }
-                ToolSpec::LocalShell {} => Some(GoogleGenAiFunctionDeclaration {
-                    name: "local_shell".to_string(),
-                    description: "Execute a shell command on the local machine.".to_string(),
-                    parameters: Some(local_shell_parameters_schema()),
-                }),
+                ToolSpec::LocalShell {} => {
+                    let parameters_json = local_shell_parameters_schema();
+                    if is_valid_json_schema(&parameters_json) {
+                        Some(GoogleGenAiFunctionDeclaration {
+                            name: "local_shell".to_string(),
+                            description: "Execute a shell command on the local machine."
+                                .to_string(),
+                            parameters: Some(parameters_json),
+                        })
+                    } else {
+                        None
+                    }
+                }
                 ToolSpec::WebSearch {} => None, // Google GenAI doesn't support our OpenAI-specific web search helper.
             })
             .collect();
@@ -432,6 +477,52 @@ pub(crate) fn build_google_genai_request(
         } else {
             None
         }
+    } else {
+        None
+    };
+
+    // Set tool config based on tool_choice
+    let tool_config = if tools.is_some() {
+        prompt.tool_choice.as_ref().map(|choice| {
+            match choice.as_str() {
+                "auto" => GoogleGenAiToolConfig {
+                    function_calling_config: GoogleGenAiFunctionCallingConfig {
+                        mode: "AUTO".to_string(),
+                        allowed_function_names: None,
+                    },
+                },
+                "none" => GoogleGenAiToolConfig {
+                    function_calling_config: GoogleGenAiFunctionCallingConfig {
+                        mode: "NONE".to_string(),
+                        allowed_function_names: None,
+                    },
+                },
+                specific => {
+                    // Check if specific tool exists in function_declarations
+                    let function_names: Vec<String> = tools.as_ref().unwrap()[0]
+                        .function_declarations
+                        .iter()
+                        .map(|fd| fd.name.clone())
+                        .collect();
+                    if function_names.contains(&specific.to_string()) {
+                        GoogleGenAiToolConfig {
+                            function_calling_config: GoogleGenAiFunctionCallingConfig {
+                                mode: "ANY".to_string(),
+                                allowed_function_names: Some(vec![specific.to_string()]),
+                            },
+                        }
+                    } else {
+                        // Fallback to AUTO if specific tool not found
+                        GoogleGenAiToolConfig {
+                            function_calling_config: GoogleGenAiFunctionCallingConfig {
+                                mode: "AUTO".to_string(),
+                                allowed_function_names: None,
+                            },
+                        }
+                    }
+                }
+            }
+        })
     } else {
         None
     };
@@ -457,6 +548,7 @@ pub(crate) fn build_google_genai_request(
     Ok(GoogleGenAiRequest {
         contents,
         tools,
+        tool_config,
         generation_config,
     })
 }
@@ -687,10 +779,20 @@ async fn process_google_genai_sse<S>(
 
                     // Handle function calls immediately.
                     if let Some(function_call) = &part.function_call {
-                        let arguments = serde_json::to_string(
-                            &function_call.args.as_ref().unwrap_or(&json!({})),
-                        )
-                        .unwrap_or_else(|_| "{}".to_string());
+                        // Validate function call
+                        if function_call.name.is_empty() {
+                            let _ = tx_event
+                                .send(Err(CodexErr::Stream(
+                                    "Received function call with empty name from Google GenAI"
+                                        .into(),
+                                    None,
+                                )))
+                                .await;
+                            continue;
+                        }
+                        let args = function_call.args.as_ref().unwrap_or(&json!({}));
+                        let arguments =
+                            serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
 
                         let item = ResponseItem::FunctionCall {
                             id: None,
@@ -815,6 +917,20 @@ fn local_shell_parameters_schema() -> JsonValue {
     })
 }
 
+/// Validates if a JSON value is a basic valid JSON Schema for function parameters.
+/// Checks for type "object" and presence of properties.
+fn is_valid_json_schema(value: &JsonValue) -> bool {
+    if let Some(obj) = value.as_object() {
+        if let Some(typ) = obj.get("type") {
+            if typ == "object" {
+                // Basic check: has type "object"
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -869,8 +985,10 @@ mod tests {
             }],
             tools: vec![],
             parallel_tool_calls: false,
+            tool_choice: Some("auto".to_string()),
             base_instructions_override: None,
             output_schema: None,
+            generation_config: None,
         }
     }
 
@@ -1348,6 +1466,79 @@ mod tests {
         assert_eq!(config.top_p, None);
         assert_eq!(config.max_output_tokens, None);
         assert_eq!(config.stop_sequences, None);
+    }
+
+    #[test]
+    fn test_tool_choice_auto() {
+        let model_family = create_test_model_family();
+        let mut prompt = create_test_prompt();
+        prompt.tool_choice = Some("auto".to_string());
+        prompt.tools = vec![ToolSpec::LocalShell {}];
+
+        let request = build_google_genai_request(&prompt, &model_family).unwrap();
+
+        assert!(request.tool_config.is_some());
+        let tool_config = request.tool_config.unwrap();
+        assert_eq!(tool_config.function_calling_config.mode, "AUTO");
+        assert!(
+            tool_config
+                .function_calling_config
+                .allowed_function_names
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_none() {
+        let model_family = create_test_model_family();
+        let mut prompt = create_test_prompt();
+        prompt.tool_choice = Some("none".to_string());
+        prompt.tools = vec![ToolSpec::LocalShell {}];
+
+        let request = build_google_genai_request(&prompt, &model_family).unwrap();
+
+        assert!(request.tool_config.is_some());
+        let tool_config = request.tool_config.unwrap();
+        assert_eq!(tool_config.function_calling_config.mode, "NONE");
+        assert!(
+            tool_config
+                .function_calling_config
+                .allowed_function_names
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_specific() {
+        let model_family = create_test_model_family();
+        let mut prompt = create_test_prompt();
+        prompt.tool_choice = Some("local_shell".to_string());
+        prompt.tools = vec![ToolSpec::LocalShell {}];
+
+        let request = build_google_genai_request(&prompt, &model_family).unwrap();
+
+        assert!(request.tool_config.is_some());
+        let tool_config = request.tool_config.unwrap();
+        assert_eq!(tool_config.function_calling_config.mode, "ANY");
+        assert_eq!(
+            tool_config.function_calling_config.allowed_function_names,
+            Some(vec!["local_shell".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_specific_not_found() {
+        let model_family = create_test_model_family();
+        let mut prompt = create_test_prompt();
+        prompt.tool_choice = Some("nonexistent".to_string());
+        prompt.tools = vec![ToolSpec::LocalShell {}];
+
+        let request = build_google_genai_request(&prompt, &model_family).unwrap();
+
+        // Should fallback to AUTO
+        assert!(request.tool_config.is_some());
+        let tool_config = request.tool_config.unwrap();
+        assert_eq!(tool_config.function_calling_config.mode, "AUTO");
     }
 
     #[tokio::test]
