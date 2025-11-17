@@ -44,6 +44,62 @@ use tracing::debug;
 use tracing::trace;
 
 // ============================================================================
+// JSON Schema Processing for Google GenAI Compatibility
+// ============================================================================
+
+/// Process a JSON schema to make it compatible with Google GenAI API.
+/// Removes unsupported fields like `additionalProperties`.
+fn process_json_schema_for_google_genai(schema: &JsonValue) -> JsonValue {
+    match schema {
+        JsonValue::Object(map) => {
+            let mut processed = serde_json::Map::new();
+
+            for (key, value) in map {
+                // Skip additionalProperties as Google GenAI doesn't support it
+                if key == "additionalProperties" {
+                    continue;
+                }
+
+                // Recursively process nested schemas
+                if key == "properties" {
+                    if let JsonValue::Object(props) = value {
+                        let mut processed_props = serde_json::Map::new();
+                        for (prop_key, prop_value) in props {
+                            processed_props.insert(prop_key.clone(), process_json_schema_for_google_genai(prop_value));
+                        }
+                        processed.insert(key.clone(), JsonValue::Object(processed_props));
+                    } else {
+                        processed.insert(key.clone(), process_json_schema_for_google_genai(value));
+                    }
+                } else if key == "items" {
+                    processed.insert(key.clone(), process_json_schema_for_google_genai(value));
+                } else if key == "anyOf" {
+                    if let JsonValue::Array(arr) = value {
+                        let processed_arr: Vec<JsonValue> = arr.iter()
+                            .map(|item| process_json_schema_for_google_genai(item))
+                            .collect();
+                        processed.insert(key.clone(), JsonValue::Array(processed_arr));
+                    } else {
+                        processed.insert(key.clone(), value.clone());
+                    }
+                } else {
+                    processed.insert(key.clone(), value.clone());
+                }
+            }
+
+            JsonValue::Object(processed)
+        }
+        JsonValue::Array(arr) => {
+            let processed_arr: Vec<JsonValue> = arr.iter()
+                .map(|item| process_json_schema_for_google_genai(item))
+                .collect();
+            JsonValue::Array(processed_arr)
+        }
+        _ => schema.clone(),
+    }
+}
+
+// ============================================================================
 // Type Definitions for Google GenAI API
 // ============================================================================
 
@@ -130,6 +186,10 @@ pub struct GoogleGenAiRequest {
     /// The conversation contents
     pub contents: Vec<GoogleGenAiContent>,
 
+    /// Optional system instructions for the model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_instruction: Option<GoogleGenAiContent>,
+
     /// Optional tools available to the model
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<GoogleGenAiTool>>,
@@ -158,10 +218,6 @@ pub struct GoogleGenAiGenerationConfig {
     /// Maximum number of tokens to generate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<i32>,
-
-    /// System instructions for the model
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_instruction: Option<String>,
 
     /// Stop sequences for generation
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,7 +327,14 @@ pub(crate) fn build_google_genai_request(
     // Get system instructions
     let full_instructions = prompt.get_full_instructions(model_family);
     let system_instruction = if !full_instructions.is_empty() {
-        Some(full_instructions.to_string())
+        Some(GoogleGenAiContent {
+            role: Some("user".to_string()),
+            parts: vec![GoogleGenAiPart {
+                text: Some(full_instructions.to_string()),
+                function_call: None,
+                function_response: None,
+            }],
+        })
     } else {
         None
     };
@@ -309,7 +372,7 @@ pub(crate) fn build_google_genai_request(
                     };
 
                     contents.push(GoogleGenAiContent {
-                        role: google_role.to_string(),
+                        role: Some(google_role.to_string()),
                         parts: vec![GoogleGenAiPart {
                             text: Some(text),
                             function_call: None,
@@ -329,7 +392,7 @@ pub(crate) fn build_google_genai_request(
                 function_call_names.insert(call_id.clone(), name.clone());
 
                 contents.push(GoogleGenAiContent {
-                    role: "model".to_string(),
+                    role: Some("model".to_string()),
                     parts: vec![GoogleGenAiPart {
                         text: None,
                         function_call: Some(GoogleGenAiFunctionCall {
@@ -364,7 +427,7 @@ pub(crate) fn build_google_genai_request(
                     .unwrap_or_else(|| "function".to_string());
 
                 contents.push(GoogleGenAiContent {
-                    role: "user".to_string(), // Function responses come from user
+                    role: Some("user".to_string()), // Function responses come from user
                     parts: vec![GoogleGenAiPart {
                         text: None,
                         function_call: None,
@@ -389,7 +452,7 @@ pub(crate) fn build_google_genai_request(
                 }
                 let args = local_shell_call_arguments(action, call_identifier);
                 contents.push(GoogleGenAiContent {
-                    role: "model".to_string(),
+                    role: Some("model".to_string()),
                     parts: vec![GoogleGenAiPart {
                         text: None,
                         function_call: Some(GoogleGenAiFunctionCall {
@@ -426,10 +489,12 @@ pub(crate) fn build_google_genai_request(
                             // Skip invalid schemas
                             None
                         } else {
+                            // Process schema to remove unsupported fields like additionalProperties
+                            let processed_params = process_json_schema_for_google_genai(params);
                             Some(GoogleGenAiFunctionDeclaration {
                                 name: func.name.clone(),
                                 description: func.description.clone(),
-                                parameters: parameters_json,
+                                parameters: Some(processed_params),
                             })
                         }
                     } else {
@@ -444,10 +509,11 @@ pub(crate) fn build_google_genai_request(
                         "description": func.format.definition.clone(),
                     });
                     if is_valid_json_schema(&parameters_json) {
+                        let processed_params = process_json_schema_for_google_genai(&parameters_json);
                         Some(GoogleGenAiFunctionDeclaration {
                             name: func.name.clone(),
                             description: func.description.clone(),
-                            parameters: Some(parameters_json),
+                            parameters: Some(processed_params),
                         })
                     } else {
                         None
@@ -456,11 +522,12 @@ pub(crate) fn build_google_genai_request(
                 ToolSpec::LocalShell {} => {
                     let parameters_json = local_shell_parameters_schema();
                     if is_valid_json_schema(&parameters_json) {
+                        let processed_params = process_json_schema_for_google_genai(&parameters_json);
                         Some(GoogleGenAiFunctionDeclaration {
                             name: "local_shell".to_string(),
                             description: "Execute a shell command on the local machine."
                                 .to_string(),
-                            parameters: Some(parameters_json),
+                            parameters: Some(processed_params),
                         })
                     } else {
                         None
@@ -532,7 +599,6 @@ pub(crate) fn build_google_genai_request(
             temperature: config.temperature,
             top_p: config.top_p,
             max_output_tokens: config.max_tokens.map(|t| t as i32),
-            system_instruction,
             stop_sequences: config.stop_sequences.clone(),
         })
     } else {
@@ -540,13 +606,13 @@ pub(crate) fn build_google_genai_request(
             temperature: None,
             top_p: None,
             max_output_tokens: None,
-            system_instruction,
             stop_sequences: None,
         })
     };
 
     Ok(GoogleGenAiRequest {
         contents,
+        system_instruction,
         tools,
         tool_config,
         generation_config,
@@ -790,7 +856,8 @@ async fn process_google_genai_sse<S>(
                                 .await;
                             continue;
                         }
-                        let args = function_call.args.as_ref().unwrap_or(&json!({}));
+                        let empty_args = json!({});
+                        let args = function_call.args.as_ref().unwrap_or(&empty_args);
                         let arguments =
                             serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
 
@@ -1000,13 +1067,11 @@ mod tests {
         let request = build_google_genai_request(&prompt, &model_family).unwrap();
 
         // Check system instruction
-        assert!(request.generation_config.is_some());
-        let config = request.generation_config.unwrap();
-        assert!(config.system_instruction.is_some());
-        assert_eq!(
-            config.system_instruction.unwrap(),
-            "You are a helpful assistant."
-        );
+        assert!(request.system_instruction.is_some());
+        let system_content = request.system_instruction.unwrap();
+        assert_eq!(system_content.role.as_ref().unwrap(), "user");
+        assert_eq!(system_content.parts.len(), 1);
+        assert_eq!(system_content.parts[0].text.as_ref().unwrap(), "You are a helpful assistant.");
 
         // Check contents
         assert_eq!(request.contents.len(), 1);
@@ -1017,20 +1082,18 @@ mod tests {
     }
 
     #[test]
-    fn test_system_instructions_in_generation_config() {
+    fn test_system_instructions_at_top_level() {
         let model_family = create_test_model_family();
         let prompt = create_test_prompt();
 
         let request = build_google_genai_request(&prompt, &model_family).unwrap();
 
-        // Ensure system instructions are correctly placed in generation_config
-        assert!(request.generation_config.is_some());
-        let config = request.generation_config.unwrap();
-        assert!(config.system_instruction.is_some());
-        assert_eq!(
-            config.system_instruction.unwrap(),
-            "You are a helpful assistant."
-        );
+        // Ensure system instructions are correctly placed at top level
+        assert!(request.system_instruction.is_some());
+        let system_content = request.system_instruction.unwrap();
+        assert_eq!(system_content.role.as_ref().unwrap(), "user");
+        assert_eq!(system_content.parts.len(), 1);
+        assert_eq!(system_content.parts[0].text.as_ref().unwrap(), "You are a helpful assistant.");
     }
 
     #[test]
@@ -1042,9 +1105,7 @@ mod tests {
         let request = build_google_genai_request(&prompt, &model_family).unwrap();
 
         // Ensure no system instructions when empty
-        assert!(request.generation_config.is_some());
-        let config = request.generation_config.unwrap();
-        assert!(config.system_instruction.is_none());
+        assert!(request.system_instruction.is_none());
     }
 
     #[test]
@@ -1442,7 +1503,28 @@ mod tests {
             config.stop_sequences,
             Some(vec!["stop".to_string(), "end".to_string()])
         );
-        assert!(config.system_instruction.is_none()); // No system instruction in test
+        assert!(request.system_instruction.is_none()); // No system instruction in test
+    }
+
+    #[test]
+    fn test_json_schema_processing_removes_additional_properties() {
+        let schema_with_additional_properties = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "number"}
+            },
+            "additionalProperties": false
+        });
+
+        let processed = process_json_schema_for_google_genai(&schema_with_additional_properties);
+
+        // additionalProperties should be removed
+        assert!(processed.get("additionalProperties").is_none());
+
+        // Other fields should remain
+        assert_eq!(processed.get("type").unwrap(), "object");
+        assert!(processed.get("properties").is_some());
     }
 
     #[test]

@@ -1939,8 +1939,10 @@ async fn run_turn(
         input,
         tools: router.specs(),
         parallel_tool_calls,
+        tool_choice: None,
         base_instructions_override: turn_context.base_instructions.clone(),
         output_schema: turn_context.final_output_json_schema.clone(),
+        generation_config: None,
     };
 
     let mut retries = 0;
