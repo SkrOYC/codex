@@ -158,6 +158,10 @@ pub struct GoogleGenAiGenerationConfig {
     /// System instructions for the model
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_instruction: Option<String>,
+
+    /// Stop sequences for generation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
 }
 
 // ============================================================================
@@ -432,15 +436,28 @@ pub(crate) fn build_google_genai_request(
         None
     };
 
-    Ok(GoogleGenAiRequest {
-        contents,
-        tools,
-        generation_config: Some(GoogleGenAiGenerationConfig {
+    let generation_config = if let Some(config) = &prompt.generation_config {
+        Some(GoogleGenAiGenerationConfig {
+            temperature: config.temperature,
+            top_p: config.top_p,
+            max_output_tokens: config.max_tokens.map(|t| t as i32),
+            system_instruction,
+            stop_sequences: config.stop_sequences.clone(),
+        })
+    } else {
+        Some(GoogleGenAiGenerationConfig {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
             system_instruction,
-        }),
+            stop_sequences: None,
+        })
+    };
+
+    Ok(GoogleGenAiRequest {
+        contents,
+        tools,
+        generation_config,
     })
 }
 
@@ -1281,6 +1298,56 @@ mod tests {
         assert_eq!(args["workdir"], json!("/tmp"));
         assert_eq!(args["timeout_ms"], json!(5000));
         assert_eq!(args["call_id"], json!("call_123"));
+    }
+
+    #[test]
+    fn test_generation_config_mapping() {
+        let model_family = create_test_model_family();
+        let mut prompt = create_test_prompt();
+        prompt.generation_config = Some(crate::client_common::GenerationConfig {
+            temperature: Some(0.8),
+            top_p: Some(0.9),
+            max_tokens: Some(200),
+            stop_sequences: Some(vec!["stop".to_string(), "end".to_string()]),
+            presence_penalty: Some(0.1), // Unsupported, should be ignored
+            frequency_penalty: Some(0.2), // Unsupported, should be ignored
+            seed: Some(123),             // Unsupported, should be ignored
+        });
+
+        let request = build_google_genai_request(&prompt, &model_family).unwrap();
+
+        let config = request.generation_config.unwrap();
+        assert_eq!(config.temperature, Some(0.8));
+        assert_eq!(config.top_p, Some(0.9));
+        assert_eq!(config.max_output_tokens, Some(200));
+        assert_eq!(
+            config.stop_sequences,
+            Some(vec!["stop".to_string(), "end".to_string()])
+        );
+        assert!(config.system_instruction.is_none()); // No system instruction in test
+    }
+
+    #[test]
+    fn test_generation_config_none_values() {
+        let model_family = create_test_model_family();
+        let mut prompt = create_test_prompt();
+        prompt.generation_config = Some(crate::client_common::GenerationConfig {
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop_sequences: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+        });
+
+        let request = build_google_genai_request(&prompt, &model_family).unwrap();
+
+        let config = request.generation_config.unwrap();
+        assert_eq!(config.temperature, None);
+        assert_eq!(config.top_p, None);
+        assert_eq!(config.max_output_tokens, None);
+        assert_eq!(config.stop_sequences, None);
     }
 
     #[tokio::test]
