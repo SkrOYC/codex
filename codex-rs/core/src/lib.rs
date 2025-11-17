@@ -9,6 +9,7 @@ mod apply_patch;
 pub mod auth;
 pub mod bash;
 mod chat_completions;
+mod google_genai;
 mod client;
 mod client_common;
 pub mod codex;
