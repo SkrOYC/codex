@@ -93,7 +93,8 @@ pub struct GoogleGenAiFunctionResponse {
 #[serde(rename_all = "camelCase")]
 pub struct GoogleGenAiContent {
     /// The role of the content producer (user or model)
-    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 
     /// The parts that make up this content
     pub parts: Vec<GoogleGenAiPart>,
@@ -129,10 +130,6 @@ pub struct GoogleGenAiRequest {
     /// The conversation contents
     pub contents: Vec<GoogleGenAiContent>,
 
-    /// Optional system instruction
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_instruction: Option<GoogleGenAiContent>,
-
     /// Optional tools available to the model
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<GoogleGenAiTool>>,
@@ -157,6 +154,10 @@ pub struct GoogleGenAiGenerationConfig {
     /// Maximum number of tokens to generate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<i32>,
+
+    /// System instructions for the model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_instruction: Option<String>,
 }
 
 // ============================================================================
@@ -232,24 +233,17 @@ pub(crate) fn get_google_genai_streaming_url(provider: &ModelProviderInfo, model
 /// Builds a Google GenAI request from a Codex Prompt.
 ///
 /// Maps Codex's internal prompt representation to Google's API format:
-/// - System instructions → systemInstruction field
+/// - System instructions → generationConfig.systemInstruction field
 /// - Conversation history → contents array with role + parts
 /// - Tools → tools array with function declarations
 pub(crate) fn build_google_genai_request(
     prompt: &Prompt,
     model_family: &ModelFamily,
 ) -> Result<GoogleGenAiRequest> {
-    // Build system instruction
+    // Get system instructions
     let full_instructions = prompt.get_full_instructions(model_family);
     let system_instruction = if !full_instructions.is_empty() {
-        Some(GoogleGenAiContent {
-            role: "user".to_string(), // Google uses "user" role for system instructions
-            parts: vec![GoogleGenAiPart {
-                text: Some(full_instructions.to_string()),
-                function_call: None,
-                function_response: None,
-            }],
-        })
+        Some(full_instructions.to_string())
     } else {
         None
     };
@@ -440,9 +434,13 @@ pub(crate) fn build_google_genai_request(
 
     Ok(GoogleGenAiRequest {
         contents,
-        system_instruction,
         tools,
-        generation_config: None, // Use defaults for now
+        generation_config: Some(GoogleGenAiGenerationConfig {
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            system_instruction,
+        }),
     })
 }
 
@@ -867,18 +865,51 @@ mod tests {
         let request = build_google_genai_request(&prompt, &model_family).unwrap();
 
         // Check system instruction
-        assert!(request.system_instruction.is_some());
-        let sys_instr = request.system_instruction.unwrap();
-        assert_eq!(sys_instr.role, "user");
-        assert_eq!(sys_instr.parts.len(), 1);
-        assert!(sys_instr.parts[0].text.is_some());
+        assert!(request.generation_config.is_some());
+        let config = request.generation_config.unwrap();
+        assert!(config.system_instruction.is_some());
+        assert_eq!(
+            config.system_instruction.unwrap(),
+            "You are a helpful assistant."
+        );
 
         // Check contents
         assert_eq!(request.contents.len(), 1);
         let content = &request.contents[0];
-        assert_eq!(content.role, "user");
+        assert_eq!(content.role.as_ref().unwrap(), "user");
         assert_eq!(content.parts.len(), 1);
         assert_eq!(content.parts[0].text.as_ref().unwrap(), "Hello, world!");
+    }
+
+    #[test]
+    fn test_system_instructions_in_generation_config() {
+        let model_family = create_test_model_family();
+        let prompt = create_test_prompt();
+
+        let request = build_google_genai_request(&prompt, &model_family).unwrap();
+
+        // Ensure system instructions are correctly placed in generation_config
+        assert!(request.generation_config.is_some());
+        let config = request.generation_config.unwrap();
+        assert!(config.system_instruction.is_some());
+        assert_eq!(
+            config.system_instruction.unwrap(),
+            "You are a helpful assistant."
+        );
+    }
+
+    #[test]
+    fn test_no_system_instructions_when_empty() {
+        let mut model_family = create_test_model_family();
+        model_family.base_instructions = "".to_string();
+        let prompt = create_test_prompt();
+
+        let request = build_google_genai_request(&prompt, &model_family).unwrap();
+
+        // Ensure no system instructions when empty
+        assert!(request.generation_config.is_some());
+        let config = request.generation_config.unwrap();
+        assert!(config.system_instruction.is_none());
     }
 
     #[test]
@@ -905,8 +936,8 @@ mod tests {
         let request = build_google_genai_request(&prompt, &model_family).unwrap();
 
         assert_eq!(request.contents.len(), 2);
-        assert_eq!(request.contents[0].role, "user");
-        assert_eq!(request.contents[1].role, "model"); // Google uses "model" not "assistant"
+        assert_eq!(request.contents[0].role.as_ref().unwrap(), "user");
+        assert_eq!(request.contents[1].role.as_ref().unwrap(), "model"); // Google uses "model" not "assistant"
         assert_eq!(
             request.contents[1].parts[0].text.as_ref().unwrap(),
             "Hi there!"
@@ -999,9 +1030,9 @@ mod tests {
         let request = build_google_genai_request(&prompt, &model_family).unwrap();
 
         assert_eq!(request.contents.len(), 3);
-        assert_eq!(request.contents[0].role, "user");
-        assert_eq!(request.contents[1].role, "model");
-        assert_eq!(request.contents[2].role, "user");
+        assert_eq!(request.contents[0].role.as_ref().unwrap(), "user");
+        assert_eq!(request.contents[1].role.as_ref().unwrap(), "model");
+        assert_eq!(request.contents[2].role.as_ref().unwrap(), "user");
     }
 
     #[test]
